@@ -1,0 +1,374 @@
+"""Native Resolve 21.1 discovery and editing controls."""
+from src.utils.resolve211_dctl import native_dctl_result
+from src.utils.resolve211_alignment import auto_align
+from src.utils.resolve211_normalization import normalize_audio
+from src.utils.resolve211_blanking import validate_blanking
+from src.utils.resolve211_encryption import encrypt_dctl
+from src.utils.resolve211_multicam import create_multicam, resolve_constant, GRADES
+from src.utils.resolve211_edits import validate_edit_options, validate_transition_options, transition_result
+from src.granular.common import (
+    mcp, READ_ONLY_TOOL, WRITE_TOOL, DESTRUCTIVE_TOOL, get_resolve, get_current_project,
+    _get_timeline, _get_timeline_item, _resolve_safe_dir, _find_clip_by_id, _requires_method, has_method,
+    granular_destructive_op,
+)
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def is_resolve_studio() -> dict:
+    """Read IsStudio (documented on Resolve 21.1+)."""
+    r = get_resolve()
+    if r is None:
+        return {"error": "Not connected to DaVinci Resolve"}
+    if not has_method(r, "IsStudio"):
+        return {"error": "IsStudio is unavailable on this Resolve build"}
+    return {"is_studio": r.IsStudio()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_keyboard_presets() -> dict:
+    """Read GetKeyboardPresetList (documented on Resolve 21.1+)."""
+    r = get_resolve()
+    if r is None:
+        return {"error": "Not connected to DaVinci Resolve"}
+    missing = _requires_method(r, "GetKeyboardPresetList", "21.1")
+    if missing:
+        return missing
+    return {"presets": r.GetKeyboardPresetList()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_current_keyboard_preset() -> dict:
+    """Read GetCurrentKeyboardPreset (documented on Resolve 21.1+)."""
+    r = get_resolve()
+    if r is None:
+        return {"error": "Not connected to DaVinci Resolve"}
+    missing = _requires_method(r, "GetCurrentKeyboardPreset", "21.1")
+    if missing:
+        return missing
+    return {"name": r.GetCurrentKeyboardPreset()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_project_settings_presets() -> dict:
+    """Read GetProjectSettingsPresetList (documented on Resolve 21.1+)."""
+    _, proj = get_current_project()
+    if proj is None:
+        return {"error": "No project currently open"}
+    missing = _requires_method(proj, "GetProjectSettingsPresetList", "21.1")
+    if missing:
+        return missing
+    return {"presets": proj.GetProjectSettingsPresetList()}
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_media_pool_item_transcription(clip_id: str, use_nested_clip_transcription: bool = False) -> dict:
+    """Read the complete 21.1 transcription dictionary for one Media Pool item, including timed words."""
+    if not isinstance(clip_id, str) or not clip_id:
+        return {"error": "clip_id must be a non-empty string"}
+    if type(use_nested_clip_transcription) is not bool:
+        return {"error": "use_nested_clip_transcription must be a boolean"}
+    _, proj = get_current_project()
+    if proj is None:
+        return {"error": "No project currently open"}
+    clip = _find_clip_by_id(proj.GetMediaPool().GetRootFolder(), clip_id)
+    if clip is None:
+        return {"error": "Media Pool item not found"}
+    missing = _requires_method(clip, "GetTranscription", "21.1")
+    if missing:
+        return missing
+    return {"transcription": clip.GetTranscription(use_nested_clip_transcription)}
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_audio_render_formats() -> dict:
+    """Read GetAudioRenderFormats (documented on Resolve 21.1+)."""
+    _, proj = get_current_project()
+    if proj is None:
+        return {"error": "No project currently open"}
+    missing = _requires_method(proj, "GetAudioRenderFormats", "21.1")
+    if missing:
+        return missing
+    return {"formats": proj.GetAudioRenderFormats()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_audio_render_codecs(format: str) -> dict:
+    """Read GetAudioRenderCodecs (documented on Resolve 21.1+). Pass an audio file extension such as wav."""
+    if not isinstance(format, str) or not format.strip():
+        return {"error": "get_audio_codecs requires a non-empty format string"}
+    _, proj = get_current_project()
+    if proj is None:
+        return {"error": "No project currently open"}
+    missing = _requires_method(proj, "GetAudioRenderCodecs", "21.1")
+    if missing:
+        return missing
+    return {"codecs": proj.GetAudioRenderCodecs(format)}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_normalize_audio_modes() -> dict:
+    """Read GetNormalizeAudioModes (documented on Resolve 21.1+)."""
+    _, tl, error = _get_timeline()
+    if error:
+        return error
+    missing = _requires_method(tl, "GetNormalizeAudioModes", "21.1")
+    if missing:
+        return missing
+    return {"modes": tl.GetNormalizeAudioModes()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_timeline_output_blanking() -> dict:
+    """Read GetOutputBlanking (documented on Resolve 21.1+). Pixel coordinates; clips inheriting timeline blanking return an empty dict."""
+    _, tl, error = _get_timeline()
+    if error:
+        return error
+    missing = _requires_method(tl, "GetOutputBlanking", "21.1")
+    if missing:
+        return missing
+    return {"blanking": tl.GetOutputBlanking()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_timeline_item_speed(track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Read GetSpeed (documented on Resolve 21.1+)."""
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "GetSpeed", "21.1")
+    if missing:
+        return missing
+    return {"speed": item.GetSpeed()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_timeline_item_fades(track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Read GetFades (documented on Resolve 21.1+). Durations are in frames."""
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "GetFades", "21.1")
+    if missing:
+        return missing
+    return {"fades": item.GetFades()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_timeline_item_type(track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Read the native lowercase TimelineItem type documented on Resolve 21.1+."""
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "GetType", "21.1")
+    if missing:
+        return missing
+    return {"type": item.GetType()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_timeline_item_output_blanking(track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Read GetOutputBlanking (documented on Resolve 21.1+). Pixel coordinates; clips inheriting timeline blanking return an empty dict."""
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "GetOutputBlanking", "21.1")
+    if missing:
+        return missing
+    return {"blanking": item.GetOutputBlanking()}
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_timeline_item_use_timeline_for_output_blanking(track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Read GetUseTimelineForOutputBlanking (documented on Resolve 21.1+)."""
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "GetUseTimelineForOutputBlanking", "21.1")
+    if missing:
+        return missing
+    return {"use_timeline": item.GetUseTimelineForOutputBlanking()}
+
+
+@mcp.tool(annotations=WRITE_TOOL)
+def set_timeline_item_speed(options: dict, track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Set native 21.1 Percentage, PitchCorrection, StretchKeyframesToFit and/or RippleTimeline. Percentage 0 freezes; RippleTimeline defaults false."""
+    error = validate_edit_options("set_speed", options)
+    if error:
+        return {"error": error}
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "SetSpeed", "21.1")
+    if missing:
+        return missing
+    return {"success": bool(item.SetSpeed(dict(options)))}
+
+
+@mcp.tool(annotations=WRITE_TOOL)
+def set_timeline_item_fades(options: dict, track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Set native 21.1 FadeIn and/or FadeOut as non-negative integer frame durations. Omitted fields remain native defaults/current state."""
+    error = validate_edit_options("set_fades", options)
+    if error:
+        return {"error": error}
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "SetFades", "21.1")
+    if missing:
+        return missing
+    return {"success": bool(item.SetFades(dict(options)))}
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL)
+@granular_destructive_op()
+def add_timeline_item_transition(options: dict, track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Add a native 21.1 transition using type/category/position/alignment and optional duration in frames. Returns actual span; clip indexes can change after insertion."""
+    error = validate_transition_options(options)
+    if error:
+        return {"error": error}
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "AddTransition", "21.1")
+    if missing:
+        return missing
+    return transition_result(item.AddTransition(dict(options)))
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL)
+@granular_destructive_op()
+def create_multicam_clip(clip_ids: list[str], options: dict | None = None) -> dict:
+    """Create native 21.1 multicam clips. Options follow MulticamOptions; named Resolve constants or numeric values accepted. Resolves every ID before writing."""
+    _, p = get_current_project()
+    if p is None:
+        return {"error": "No project currently open"}
+    mp = p.GetMediaPool()
+    missing = _requires_method(mp, "CreateMulticamClip", "21.1")
+    if missing:
+        return missing
+    return create_multicam(get_resolve(), mp, clip_ids, {} if options is None else options, _find_clip_by_id)
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL)
+@granular_destructive_op()
+def flatten_timeline_item_multicam(grade_option: str = "FLATTEN_MULTICAM_COPY_GRADE", track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Flatten a native multicam item using COPY_GRADE or RETAIN_GRADE_FROM_ANGLE. Re-query items after replacement."""
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "FlattenMulticam", "21.1")
+    if missing:
+        return missing
+    grade, error = resolve_constant(get_resolve(), grade_option, GRADES)
+    if error:
+        return {"error": error}
+    return {"success": bool(item.FlattenMulticam(grade))}
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL)
+@granular_destructive_op()
+def set_timeline_output_blanking(options: dict) -> dict:
+    """Set native 21.1 timeline Top/Bottom/Left/Right pixel coordinates."""
+    error = validate_blanking(options)
+    if error:
+        return {"error": error}
+    _, tl, error = _get_timeline()
+    if error:
+        return error
+    missing = _requires_method(tl, "SetOutputBlanking", "21.1")
+    if missing:
+        return missing
+    return {"success": bool(tl.SetOutputBlanking(dict(options)))}
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL)
+@granular_destructive_op()
+def set_timeline_item_output_blanking(options: dict, track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Set native 21.1 clip pixel coordinates. Disable timeline blanking inheritance first; this call does not change inheritance."""
+    error = validate_blanking(options)
+    if error:
+        return {"error": error}
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "SetOutputBlanking", "21.1")
+    if missing:
+        return missing
+    return {"success": bool(item.SetOutputBlanking(dict(options)))}
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL)
+@granular_destructive_op()
+def set_timeline_item_use_timeline_for_output_blanking(use_timeline: bool, track_type: str = "video", track_index: int = 1, item_index: int = 0) -> dict:
+    """Explicitly enable/disable native 21.1 timeline blanking inheritance for a clip."""
+    if type(use_timeline) is not bool:
+        return {"error": "use_timeline must be a boolean"}
+    if track_type not in ("video", "audio") or track_index < 1 or item_index < 0:
+        return {"error": "Use video/audio, a 1-based track index and a non-negative item index"}
+    item, error = _get_timeline_item(track_type, track_index, item_index)
+    if error:
+        return error
+    missing = _requires_method(item, "SetUseTimelineForOutputBlanking", "21.1")
+    if missing:
+        return missing
+    return {"success": bool(item.SetUseTimelineForOutputBlanking(use_timeline))}
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL)
+@granular_destructive_op()
+def normalize_timeline_audio_level(item_ids: list[str], options: dict | None = None) -> dict:
+    """Native 21.1 normalization of explicit audio timeline item IDs. Options normalizationMode, targetLevel (dBFS), targetLoudness (LKFS), setLevelMode; use get_normalize_audio_modes for names."""
+    _, timeline, error = _get_timeline()
+    if error:
+        return error
+    missing = _requires_method(timeline, "NormalizeAudioLevel", "21.1")
+    if missing:
+        return missing
+    return normalize_audio(get_resolve(), timeline, item_ids, {} if options is None else options)
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL)
+@granular_destructive_op()
+def auto_align_timeline_clips(item_ids: list[str], options: dict | None = None) -> dict:
+    """Native 21.1 alignment of current video/audio items by unique ID. Include linked audio AND video IDs to move both; selection is not expanded. Options SyncUsing and UseTrack accept documented constant names or integral native values."""
+    _, timeline, error = _get_timeline()
+    if error:
+        return error
+    missing = _requires_method(timeline, "AutoAlignClips", "21.1")
+    if missing:
+        return missing
+    return auto_align(get_resolve(), timeline, item_ids, {} if options is None else options)
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def validate_dctl_native(source: str) -> dict:
+    """Validate shader source with Resolve 21.1. Source layout and native diagnostics are preserved; success means validation, not a rendered shader test."""
+    if not isinstance(source, str):
+        return {"error": "source must be a string"}
+    r = get_resolve()
+    if r is None:
+        return {"error": "Not connected to DaVinci Resolve"}
+    missing = _requires_method(r, "ValidateDCTL", "21.1")
+    if missing:
+        return missing
+    return native_dctl_result(r, source)
+
+@mcp.tool(annotations=WRITE_TOOL)
+def encrypt_dctl_native(input_path: str, output_path: str, expiry: str | None = None) -> dict:
+    """Encrypt a .dctl to a new .dctle using Resolve 21.1. Never overwrites. Empty/null expiry means no expiry; ISO 8601 strings pass to Resolve. Source is unchanged."""
+    r = get_resolve()
+    if r is None:
+        return {"error": "Not connected to DaVinci Resolve"}
+    missing = _requires_method(r, "EncryptDCTL", "21.1")
+    if missing:
+        return missing
+    return encrypt_dctl(r, input_path, output_path, expiry, _resolve_safe_dir)

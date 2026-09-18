@@ -1,0 +1,14 @@
+# Virtual environment (recreate with the Install steps in README.md)
+venv/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Runtime logs (directory is kept via logs/.gitkeep)
+logs/*
+!logs/.gitkeep
+
+# macOS
+.DS_Store

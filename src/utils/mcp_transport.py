@@ -1,0 +1,159 @@
+"""Networked transport for the MCP server (opt-in via --transport).
+
+stdio remains the default. The `sse` and `streamable-http` modes bind to
+loopback (127.0.0.1) by default and REQUIRE a bearer token on every request, so
+turning networking on never silently exposes Resolve. The token comes from
+``$DAVINCI_MCP_TOKEN`` or is generated at startup. A small state file (0600,
+under the per-user private state dir — never a shared tempdir) lets the control
+panel show the live connection URL + token; that file is the only place a
+generated token is written. It is never logged: the server's root logger
+appends to ``logs/server.log`` with the default file mode and never truncates
+it, so a logged token would outlive the session in a file the state file's
+0600 was chosen to avoid. An interactive operator sees it once on stderr.
+
+Security posture:
+- Default host is loopback; a non-loopback bind logs a loud warning.
+- Every HTTP request must carry ``Authorization: Bearer <token>`` (constant-time
+  compared); otherwise 401.
+- stdio (the default transport) is unaffected by anything here.
+"""
+import json
+import logging
+import os
+import secrets
+import sys
+import time
+
+from src.utils.private_state import private_state_dir, write_private_json
+
+logger = logging.getLogger("davinci-resolve-mcp")
+
+
+def _state_path() -> str:
+    return os.path.join(private_state_dir(), "mcp_transport.json")
+
+
+# Resolved lazily so DAVINCI_RESOLVE_MCP_STATE_DIR set by a test harness is honored.
+TRANSPORT_STATE_PATH = _state_path()
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def resolve_token():
+    """Return (token, was_generated). Honors $DAVINCI_MCP_TOKEN."""
+    tok = os.environ.get("DAVINCI_MCP_TOKEN")
+    if tok:
+        return tok, False
+    return secrets.token_urlsafe(32), True
+
+
+def _auth_middleware_cls(token):
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    expected = f"Bearer {token}"
+
+    class BearerAuth(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            provided = request.headers.get("authorization", "")
+            if not secrets.compare_digest(provided, expected):
+                return JSONResponse(
+                    {"error": "unauthorized: Authorization: Bearer <token> required"},
+                    status_code=401,
+                )
+            return await call_next(request)
+
+    return BearerAuth
+
+
+def write_transport_state(transport, host, port, token):
+    try:
+        write_private_json(TRANSPORT_STATE_PATH, {
+            "transport": transport,
+            "host": host,
+            "port": port,
+            "url": f"http://{host}:{port}",
+            "token": token,
+            "loopback": host in LOOPBACK_HOSTS,
+            "pid": os.getpid(),
+            "started_at": time.time(),
+        })
+    except OSError as exc:
+        logger.warning("could not write transport state: %s", exc)
+
+
+def clear_transport_state():
+    try:
+        os.remove(TRANSPORT_STATE_PATH)
+    except OSError:
+        pass
+
+
+def read_transport_state():
+    """Return the live transport state dict, or None if no networked instance.
+
+    Treats a state file whose pid is no longer alive as stale (returns None).
+    """
+    try:
+        with open(TRANSPORT_STATE_PATH, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    pid = state.get("pid")
+    if isinstance(pid, int):
+        try:
+            os.kill(pid, 0)
+        except (OSError, ProcessLookupError):
+            return None
+    return state
+
+
+def _stderr_is_interactive() -> bool:
+    """True only when stderr is a terminal a person is looking at."""
+    try:
+        return bool(sys.stderr and sys.stderr.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def run_networked(mcp, transport):
+    """Serve `mcp` over an authenticated HTTP transport ('sse'|'streamable-http')."""
+    import uvicorn
+
+    host = os.environ.get("DAVINCI_MCP_HOST") or mcp.settings.host or "127.0.0.1"
+    port = int(os.environ.get("DAVINCI_MCP_PORT") or mcp.settings.port or 8000)
+    mcp.settings.host = host
+    mcp.settings.port = port
+    token, generated = resolve_token()
+
+    app = mcp.sse_app() if transport == "sse" else mcp.streamable_http_app()
+    app.add_middleware(_auth_middleware_cls(token))
+
+    if host not in LOOPBACK_HOSTS:
+        logger.warning(
+            "SECURITY: MCP %s transport bound to NON-loopback host %r — Resolve "
+            "control is exposed on the network. Ensure this is intended.",
+            transport, host,
+        )
+    logger.info("MCP %s transport: http://%s:%s (bearer token required)",
+                transport, host, port)
+    if generated:
+        # The token is the transport's only access control. Log WHERE it is,
+        # never WHAT it is: this record propagates to the root logger, which
+        # src/server.py points at logs/server.log — default file mode, appended
+        # forever, no cleanup in our finally: — whereas the state file is 0600
+        # and cleared at shutdown. The console gets the value only when a person
+        # is watching it (a TTY); a redirected stderr is just another file.
+        logger.info(
+            "Generated a bearer token; it is recorded in %s (0600). "
+            "Set $DAVINCI_MCP_TOKEN to pin your own.",
+            TRANSPORT_STATE_PATH,
+        )
+        if _stderr_is_interactive():
+            print(f"davinci-resolve-mcp: bearer token for this session: {token}",
+                  file=sys.stderr, flush=True)
+
+    write_transport_state(transport, host, port, token)
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="warning")
+    finally:
+        clear_transport_state()
